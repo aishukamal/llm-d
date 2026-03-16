@@ -8,7 +8,7 @@ This guide covers the autoscaling strategies available in llm-d. Both use the Ku
 
 ## HPA + IGW Metrics
 
-The [HPA + IGW Metrics](./README.hpa-igw.md) path integrates the Kubernetes Horizontal Pod Autoscaler (HPA) with signals emitted directly by the Inference Gateway (IGW). The guide demonstrates autoscaling using queue depth and running request counts from the Endpoint Picker (EPP), but other metrics emitted by the IGW can be used depending on your scaling requirements. These signals reflect the actual state of the inference queue, enabling the HPA to scale out before users experience high latency and scale in when capacity is genuinely idle. This path requires only the standard Kubernetes HPA and the Prometheus Adapter, with no additional controllers.
+The [HPA + IGW Metrics](./README.hpa-igw.md) path integrates the Kubernetes Horizontal Pod Autoscaler (HPA) with signals emitted directly by the Inference Gateway (IGW). The guide demonstrates autoscaling using queue depth and running request counts from the Endpoint Picker (EPP), but other metrics emitted by the IGW can be used depending on your scaling requirements. These signals reflect the actual state of the inference queue, enabling the HPA to scale out before users experience high latency and scale in when capacity is genuinely idle. This path requires only the standard Kubernetes HPA and the Prometheus Adapter, with no additional controllers. KEDA can be used as an alternative to native HPA for alpha features such as scale-to-zero if your cluster does not support alpha feature gates.
 
 ## Workload Variant Autoscaler (WVA)
 

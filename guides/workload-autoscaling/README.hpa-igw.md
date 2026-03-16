@@ -203,6 +203,6 @@ HPA supports scaling to zero through the `HPAScaleToZero` alpha feature flag. Th
 
 If your environment does not allow alpha feature gates, KEDA is a stable alternative.
 
-1. **Setup KEDA:** Install KEDA and follow the [KEDA Prometheus Scaler guide](https://keda.sh/docs/scalers/prometheus/).
+1. **Setup KEDA:** Install KEDA and follow the [KEDA Prometheus Scaler guide](https://keda.sh/docs/scalers/prometheus/). Note that KEDA comes with its own built-in metrics adapter that is enabled by default when you install KEDA. Unlike HPA, it does not require the Prometheus adapter installation.
 2. **Configure Scaler:** Use the same `igw_queue_depth` metric as a trigger.
 3. **Outcome:** KEDA scales the deployment from 0 to 1 as soon as a request is queued. Once at 1 pod, the standard HPA (configured with `minReplicas: 1`) takes over to scale up to N.
