@@ -66,16 +66,55 @@ will own this coordination. None of them build it. IRO is that component.
 ## Proposal
 
 IRO sits between the infrastructure layer and the inference engine. When a
-hardware fault occurs, the infrastructure recovery controller creates a
-`RecoveryRequest` CRD carrying the resolved recovery action. IRO watches
-`RecoveryRequest`, coordinates the engine-side response, and restores serving
-capacity once infrastructure recovery completes.
+hardware fault occurs, the "infrastructure recovery controller" creates a
+`RecoveryRequest` CRD (a new CRD introduced by this proposal) carrying the
+resolved recovery action. IRO watches `RecoveryRequest`, coordinates the
+engine-side response, and restores serving capacity once infrastructure
+recovery completes.
 
-The infrastructure recovery controller owns the fault-to-action mapping and all
-operator override logic. IRO trusts `requestedAction` on `RecoveryRequest` as
-the final resolved decision.
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                        Infrastructure layer                          │
+│     Cloud agents · on-prem monitors · hardware fault detectors       │
+│                  Infrastructure recovery controller                  │
+└───────────────┬──────────────────────────▲───────────────────────────┘
+                │ RecoveryRequest CRD      │ RecoveryRequest status
+                │ (write)                  │ (read)
+┌───────────────▼──────────────────────────┴───────────────────────────┐
+│                 Inference Resilience Operator (IRO)                  │
+│                                                                      │
+│  ┌──────────────────────────────┐  ┌─────────────────────────────┐   │
+│  │     InferenceReconciler      │  │      Rank topology map      │   │
+│  │       state machine          │  │  nodeName + deviceID → rank │   │
+│  └──────────────────────────────┘  └─────────────────────────────┘   │
+│                                                                      │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐  │
+│  │        vLLM EngineAdapter (implements EngineAdapter interface) │  │
+│  │                  Discovers vLLM API server                     │  │
+│  │            HTTP client → vLLM service endpoint                 │  │
+│  │               ZMQ SUB → vLLM fault notify port                 │  │
+│  └───────────────────┬───────────────────────▲────────────────────┘  │
+└──────────────────────┼───────────────────────┼───────────────────────┘
+                       │ HTTP to engine        │ ZMQ fault events
+                       │ API server            │
+┌──────────────────────▼───────────────────────┴───────────────────────┐
+│                          Inference engine                            │
+│                  API server · ClientSentinel · EngineCore            │
+└──────────────────────────────────────────────────────────────────────┘
+```
 
-Engine recovery tracks are determined entirely by `requestedAction`:
+The "infrastructure recovery controller" in this context is a cloud provider
+specific or vendor specific component (e.g., a GKE node repair daemon, or a custom
+controller) that watches for hardware errors, then creates a `RecoveryRequest` CR in
+Kubernetes. The infrastructure recovery controller owns the fault-to-action
+mapping and all operator override logic for the infrastructure layer. IRO trusts
+`requestedAction` on `RecoveryRequest` as the final decision and coordinates the
+engine-side response accordingly. IRO will ship a reference implementation of the
+infrastructure recovery controller but the interface is open to any Kubernetes
+provider.
+
+Engine recovery tracks are inferred from `requestedAction` on `RecoveryRequest`:
 
 - **RESET_DEVICE → Track A**: pause engine, reset device, resume engine (seconds)
 - **REBOOT_NODE → Track B**: pause engine, reboot node, resume engine (minutes).
@@ -114,12 +153,12 @@ entirely encapsulated in the adapter.
 
 ## Design Details
 
-### CRD
+### Infrastructure Provider-IRO Interface (CRD)
 
-IRO is defined by one CRD. The infrastructure recovery controller creates
-`RecoveryRequest` when it detects a hardware fault on a node running an inference
-workload. IRO watches it, coordinates engine recovery, and tracks infrastructure
-recovery completion via it.
+IRO is dependent on a new CRD that infrastructure recovery agents are expected to
+produce. The infrastructure recovery controller creates `RecoveryRequest` when it
+detects a hardware fault on a node running an inference workload. IRO watches it,
+coordinates engine recovery, and tracks infrastructure recovery completion via it.
 
 **RecoveryRequest** (created by infrastructure recovery controller, consumed by IRO):
 
@@ -132,13 +171,21 @@ recovery completion via it.
   infrastructure recovery controller; IRO watches for Completed to resume the engine)
 - `status.conditions[EngineReadyForRecovery]` — optional; see open question below
 
-### EngineAdapter interface
+### IRO-Inference Engine Interface (EngineAdapter)
 
-The interface exposes operations such as `PauseEngine`, `ResumeEngine`,
-`ScaleDown(new_world_size)`, `ScaleUp(new_world_size)`, `FaultEvents`, and
-`EngineStatus`, mapped to the fault tolerance and elastic EP APIs being developed
-in the vLLM RFCs (PR #34833, RFC #28243, RFC #20323). The exact operations and
-their mapping to engine APIs are subject to refinement as those APIs stabilize.
+The EngineAdapter interface exposes operations mapped to the fault tolerance and
+elastic EP APIs being developed in the vLLM RFCs (PR #34833, RFC #28243, RFC #20323).
+The exact operations and their mapping to engine APIs are subject to refinement as
+those APIs stabilize.
+
+| EngineAdapter Operation | vLLM API | RFC / PR | Status |
+| :--- | :--- | :--- | :--- |
+| **FaultEvents** | ZMQ `vllm_fault` PUB | RFC #27866 / PR #34833 | Draft PR |
+| **EngineStatus** | `GET /fault_tolerance/status` | RFC #27866 / PR #34833 | Draft PR |
+| **PauseEngine** | `POST /fault_tolerance/apply {pause}` | RFC #27866 / PR #34833 | Draft PR |
+| **ResumeEngine** | `POST /fault_tolerance/apply {retry}` | RFC #27866 / PR #34833 | Draft PR |
+| **ScaleDown(new_world_size)** | `handle_eep_event {SCALING_REQUEST}` to API server | RFC #28243 | Proposed |
+| **ScaleUp(new_world_size)** | `handle_eep_event {SCALING_REQUEST}` + NOTIFICATION to rank 0 | RFC #28243 | Proposed |
 
 ### Dual input channels
 
@@ -146,13 +193,34 @@ IRO receives fault signals from two independent directions with distinct,
 non-overlapping responsibilities:
 
 - **RecoveryRequest** (infrastructure-initiated) — the primary input channel. IRO
-  coordinates the full engine recovery sequence: pause engine, coordinate with
-  infrastructure recovery, then resume or scale up the engine once
-  `RecoveryRequest.status.phase` reaches Completed.
+  coordinates the full engine recovery sequence: pause or scale down engine, coordinate
+  with infrastructure recovery, then resume or scale up the engine once
+  `RecoveryRequest.status.phase` reaches Completed state.
 - **Engine fault events via ZMQ** (engine-initiated) - when the engine's internal
   fault monitoring pushes a fault notification with no corresponding
   `RecoveryRequest`, the fault is treated as transient and engine-internal. IRO
   tells the engine to retry without triggering any infrastructure recovery action.
+
+### Sequence of events
+
+```mermaid
+sequenceDiagram
+    participant InfraAgent as Infrastructure Recovery Controller
+    participant K8s as Kubernetes API
+    participant IRO
+    participant Engine as vLLM Engine
+
+    InfraAgent->>K8s: Detect fault and create RecoveryRequest (REPLACE_NODE)
+    IRO->>K8s: Watch RecoveryRequest (phase=Pending)
+    IRO->>Engine: ScaleDown()
+    Engine->>IRO: OK
+    IRO->>K8s: Update RecoveryRequest status (EngineReadyForRecovery=True)
+    InfraAgent->>K8s: Update phase=InProgress, replace node
+    InfraAgent->>K8s: Update phase=Completed when replacement node is ready
+    IRO->>K8s: Watch RecoveryRequest (phase=Completed)
+    IRO->>Engine: ScaleUp()
+    Engine->>IRO: OK
+```
 
 ### Open question: should infrastructure recovery gate on IRO?
 
